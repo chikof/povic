@@ -1,22 +1,25 @@
-use app::App;
 use color_eyre::Result;
 
-mod app;
-pub mod controllers;
+use crate::app::App;
 
-#[cfg(target_os = "windows")]
-mod windows;
+mod action;
+mod app;
+mod components;
+mod config;
+mod errors;
+mod logging;
+mod tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install()?;
+    let config = crate::config::init()?;
 
-    let terminal = ratatui::init();
-    let app_result = App::default()
-        .run(terminal)
-        .await;
+    crate::errors::init()?;
+    crate::logging::init(&config)?;
 
-    ratatui::restore();
+    let mut app = App::new(config)?;
+    app.run()
+        .await?;
 
-    app_result
+    Ok(())
 }

@@ -1,167 +1,226 @@
-use std::time::Duration;
-
 use color_eyre::Result;
-use crossterm::event::{Event, EventStream, KeyCode};
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{DefaultTerminal, Frame};
-use tokio_stream::StreamExt;
+use crossterm::event::KeyEvent;
+use ratatui::prelude::Rect;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
 
-use crate::controllers::cpu::{cpu, cpu_threads};
-use crate::controllers::disk::disk;
-use crate::controllers::gpu::gpu;
-use crate::controllers::memory::memory;
-use crate::controllers::os::os;
+use crate::action::Action;
+use crate::components::Component;
+use crate::components::fps::FpsCounter;
+use crate::components::home::Home;
+use crate::config::AppConfig;
+use crate::tui::{Event, Tui};
 
-#[derive(Debug)]
 pub struct App {
+    config: AppConfig,
+    components: Vec<Box<dyn Component>>,
     should_quit: bool,
-
-    show_detailed_cpu: bool,
-
-    /// 0: memory, 1: disk, 2: os
-    osrametc: u8,
-
-    /// Thread safe system information
-    system: Box<sysinfo::System>,
+    should_suspend: bool,
+    mode: Mode,
+    last_tick_key_events: Vec<KeyEvent>,
+    action_tx: mpsc::UnboundedSender<Action>,
+    action_rx: mpsc::UnboundedReceiver<Action>,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        let system = sysinfo::System::new_all();
-
-        Self {
-            should_quit: false,
-            show_detailed_cpu: false,
-            osrametc: 0,
-            system: Box::new(system),
-        }
-    }
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mode {
+    #[default]
+    Home,
 }
 
 impl App {
-    const FRAMES_PER_SECOND: f32 = 23.0;
+    pub fn new(config: AppConfig) -> Result<Self> {
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            components: vec![Box::new(Home::new(config.clone())), Box::new(FpsCounter::default())],
+            should_quit: false,
+            should_suspend: false,
+            config,
+            mode: Mode::Home,
+            last_tick_key_events: Vec::new(),
+            action_tx,
+            action_rx,
+        })
+    }
 
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
-        let period = Duration::from_secs_f32(1.0 / Self::FRAMES_PER_SECOND);
-        let mut interval = tokio::time::interval(period);
-        let mut events = EventStream::new();
+    pub async fn run(&mut self) -> Result<()> {
+        let mut tui = Tui::new()?
+            // .mouse(true) // uncomment this line to enable mouse support
+            .tick_rate(self.config.tick_rate)
+            .frame_rate(self.config.frame_rate);
+        tui.enter()?;
 
-        while !self.should_quit {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let cpua = cpu(&mut self.system).await;
-                    let gpua = gpu().await;
+        for component in self
+            .components
+            .iter_mut()
+        {
+            component.register_action_handler(
+                self.action_tx
+                    .clone(),
+            )?;
+        }
+        for component in self
+            .components
+            .iter_mut()
+        {
+            component.register_config_handler(
+                self.config
+                    .clone(),
+            )?;
+        }
+        for component in self
+            .components
+            .iter_mut()
+        {
+            component.init(tui.size()?)?;
+        }
 
-                    terminal.draw(|frame|
-                        self.render(frame, cpua.to_string(), gpua.to_string())
-                    )?;
-                },
+        let action_tx = self
+            .action_tx
+            .clone();
+        loop {
+            self.handle_events(&mut tui)
+                .await?;
+            self.handle_actions(&mut tui)?;
+            if self.should_suspend {
+                tui.suspend()?;
+                action_tx.send(Action::Resume)?;
+                action_tx.send(Action::ClearScreen)?;
+                // tui.mouse(true);
+                tui.enter()?;
+            } else if self.should_quit {
+                tui.stop()?;
+                break;
+            }
+        }
+        tui.exit()?;
+        Ok(())
+    }
 
-                Some(Ok(event)) = events.next() => self.handle_event(&event),
+    async fn handle_events(&mut self, tui: &mut Tui) -> Result<()> {
+        let Some(event) = tui
+            .next_event()
+            .await
+        else {
+            return Ok(());
+        };
+
+        let action_tx = self
+            .action_tx
+            .clone();
+
+        match event {
+            Event::Quit => action_tx.send(Action::Quit)?,
+            Event::Tick => action_tx.send(Action::Tick)?,
+            Event::Render => action_tx.send(Action::Render)?,
+            Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
+            Event::Key(key) => self.handle_key_event(key)?,
+            _ => {},
+        }
+
+        for component in self
+            .components
+            .iter_mut()
+        {
+            if let Some(action) = component.handle_events(Some(event.clone()))? {
+                action_tx.send(action)?;
             }
         }
 
         Ok(())
     }
 
-    fn render(&mut self, frame: &mut Frame, cpua: String, gpua: String) {
-        // ete de la cpu
-        let cpuph = if self.show_detailed_cpu { String::new() } else { cpua };
-        // aca va a ir el de la computadora en general
-        // falta hacer lo de la temperatura
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        let action_tx = self
+            .action_tx
+            .clone();
 
-        let vertical_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(frame.area());
+        // let Some(keymap) = self
+        //     .config
+        //     .key_bindings
+        //     .get(&self.mode)
+        // else {
+        //     return Ok(());
+        // };
+        //
+        // match keymap.get(&vec![key]) {
+        //     Some(action) => {
+        //         info!("Got action: {action:?}");
+        //         action_tx.send(action.clone())?;
+        //     },
+        //     _ => {
+        //         // If the key was not handled as a single key action,
+        //         // then consider it for multi-key combinations.
+        //         self.last_tick_key_events
+        //             .push(key);
+        //
+        //         // Check for multi-key combinations
+        //         if let Some(action) = keymap.get(&self.last_tick_key_events) {
+        //             info!("Got action: {action:?}");
+        //             action_tx.send(action.clone())?;
+        //         }
+        //     },
+        // }
 
-        let top_row = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(vertical_chunks[0]);
-
-        let left_col = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(top_row[0]);
-
-        frame.render_widget(
-            Paragraph::new(gpua).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("GPU Info")
-                    .style(Style::default().fg(Color::White)),
-            ),
-            left_col[0],
-        );
-
-        let texto_ram = match self.osrametc {
-            0 => memory(&mut self.system),
-            1 => disk(),
-            2 => os(),
-            _ => memory(&mut self.system),
-        };
-
-        frame.render_widget(
-            Paragraph::new(texto_ram).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Os/Memoria/Discos - Hotkey: o, m, d")
-                    .style(Style::default().fg(Color::White)),
-            ),
-            left_col[1],
-        );
-
-        let cpu_widget = if self.show_detailed_cpu {
-            let text = cpu_threads(&mut self.system)
-                .into_iter()
-                .map(|(line, color)| ratatui::text::Line::styled(line, Style::default().fg(color)))
-                .collect::<Vec<_>>();
-
-            Paragraph::new(text).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("CPU Threads - Hotkey: shift+c (info)")
-                    .style(Style::default()),
-            )
-        } else {
-            Paragraph::new(cpuph).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("CPU Info - Hotkey: c (threads)")
-                    .style(Style::default().fg(Color::White)),
-            )
-        };
-
-        frame.render_widget(cpu_widget, top_row[1]);
-
-        // en esta parete me gustaria que haya un grafico tipo osciloscopio que sea
-        // 0-100% de cpu, gpu
-        frame.render_widget(
-            Paragraph::new("blablabla blebleble blublublu").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Is this thing on?")
-                    .style(Style::default().fg(Color::White)),
-            ),
-            vertical_chunks[1],
-        );
+        Ok(())
     }
 
-    fn handle_event(&mut self, event: &Event) {
-        if let Some(key) = event.as_key_press_event() {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-                KeyCode::Char('c') => self.show_detailed_cpu = true,
-                KeyCode::Char('C') => self.show_detailed_cpu = false,
-                KeyCode::Char('m') => self.osrametc = 0,
-                KeyCode::Char('d') => self.osrametc = 1,
-                KeyCode::Char('o') => self.osrametc = 2,
+    fn handle_actions(&mut self, tui: &mut Tui) -> Result<()> {
+        while let Ok(action) = self
+            .action_rx
+            .try_recv()
+        {
+            if action != Action::Tick && action != Action::Render {
+                debug!("{action:?}");
+            }
+            match action {
+                Action::Tick => {
+                    self.last_tick_key_events
+                        .drain(..);
+                },
+                Action::Quit => self.should_quit = true,
+                Action::Suspend => self.should_suspend = true,
+                Action::Resume => self.should_suspend = false,
+                Action::ClearScreen => tui
+                    .terminal
+                    .clear()?,
+                Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
+                Action::Render => self.render(tui)?,
                 _ => {},
             }
+            for component in self
+                .components
+                .iter_mut()
+            {
+                if let Some(action) = component.update(action.clone())? {
+                    self.action_tx
+                        .send(action)?
+                };
+            }
         }
+        Ok(())
+    }
+
+    fn handle_resize(&mut self, tui: &mut Tui, w: u16, h: u16) -> Result<()> {
+        tui.resize(Rect::new(0, 0, w, h))?;
+        self.render(tui)?;
+        Ok(())
+    }
+
+    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        tui.draw(|frame| {
+            for component in self
+                .components
+                .iter_mut()
+            {
+                if let Err(err) = component.draw(frame, frame.area()) {
+                    let _ = self
+                        .action_tx
+                        .send(Action::Error(format!("Failed to draw: {:?}", err)));
+                }
+            }
+        })?;
+        Ok(())
     }
 }

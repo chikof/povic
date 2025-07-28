@@ -1,3 +1,7 @@
 /target
 .direnv/
 .bacon-locations
+
+logs/
+config.toml
+keybindings.toml
